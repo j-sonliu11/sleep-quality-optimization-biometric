@@ -1,0 +1,141 @@
+############################
+# OS / Editor
+############################
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+############################
+# Python / Virtualenv
+############################
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+pip-wheel-metadata/
+
+.venv/
+venv/
+ENV/
+env/
+
+############################
+# Jupyter / IPython
+############################
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+############################
+# Logs / Temp
+############################
+*.log
+logs/
+tmp/
+temp/
+
+############################
+# Secrets / Local config
+############################
+.env
+.env.*
+*.key
+*.pem
+*.p12
+credentials*.json
+secrets*.json
+
+############################
+# Data (DO NOT COMMIT RAW BIOMETRICS)
+############################
+data/raw/
+data/processed/
+data/private/
+datasets/
+**/*recordings*/
+**/*recording*/
+**/*muse*/
+**/*eeg*/
+**/*ppg*/
+**/*eog*/
+
+# Common data files (allow small examples in data/examples/)
+*.edf
+*.bdf
+*.fif
+*.set
+*.csv
+*.tsv
+*.parquet
+*.h5
+*.hdf5
+*.mat
+*.npy
+*.npz
+*.wav
+
+!data/examples/
+!data/examples/**
+
+############################
+# ML artifacts / runs
+############################
+runs/
+checkpoints/
+models/
+artifacts/
+wandb/
+mlruns/
+tensorboard/
+lightning_logs/
+
+*.joblib
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.h5
+
+############################
+# Streamlit
+############################
+.streamlit/secrets.toml
+
+############################
+# Node / Web (if you add a frontend later)
+############################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+
+############################
+# CAD / Hardware (optional)
+# (Uncomment if you don't want to version these)
+############################
+# *.stl
+# *.step
+# *.stp
+# *.sldprt
+# *.sldasm
+# *.f3d
+# *.iges
+# *.igs
