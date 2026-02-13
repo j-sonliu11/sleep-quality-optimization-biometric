@@ -1,0 +1,777 @@
+# xgboost_train_sleep.py
+# DREAMT: EEG + HR (from ECG) ONLY, 30s epochs
+# Multi-night training from a folder of CSVs (Option A)
+# - Excludes label "P"
+# - Keeps labels W, N1, N2, N3, R (N3 included when present)
+# - Night-wise split (recommended) to avoid leakage
+# - Per-night robust normalization (median/IQR) BEFORE epoch features
+# - Bandpower features (no scipy; uses numpy FFT + numpy.trapezoid)
+# - Early stopping via native xgboost.train (works even when sklearn wrapper doesn't)
+# COPY-PASTE THIS WHOLE FILE.
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import joblib
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import LabelEncoder
+
+try:
+    import xgboost as xgb
+except ModuleNotFoundError:
+    print("\n[ERROR] xgboost is not installed.\n")
+    print("Fix:")
+    print("  python -m pip install -U pip")
+    print("  python -m pip install xgboost")
+    raise
+
+
+# =========================
+# MODE
+# =========================
+MODE = "train"  # "train" or "predict"
+
+
+# =========================
+# PATHS (EDIT THESE)
+# =========================
+PROJECT_ROOT = Path(r"E:\physionet\physionet.org\files")
+
+# Folder with many DREAMT CSVs (e.g., data_100Hz)
+IN_DIR = PROJECT_ROOT / "Data" / "dreamt" / "2.1.0" / "data_100Hz"
+IN_FILES = sorted(IN_DIR.glob("*.csv"))  # all nights in folder
+
+XGBOOST_DIR = PROJECT_ROOT / "XGBoost"
+RUNS_DIR = XGBOOST_DIR / "runs"
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
+
+# For MODE="predict": point to the run folder you want to use
+MODEL_BUNDLE_PATH = RUNS_DIR / "run_YYYYMMDD_HHMMSS" / "model_bundle.joblib"  # <-- EDIT for predict
+
+
+# =========================
+# COLUMNS IN YOUR CSV
+# =========================
+TIME_COL = "TIMESTAMP"
+LABEL_COL = "Sleep_Stage"  # required for training
+ECG_COL = "ECG"            # ECG waveform
+
+# EEG columns in your DREAMT CSV
+EEG_COLS = [
+    "C4-M1",
+    "F4-M1",
+    "O2-M1",
+    "Fp1-O2",
+    "T3 - CZ",
+    "CZ - T4",
+]
+
+
+# =========================
+# LABEL FILTERING
+# =========================
+EXCLUDE_LABELS = {"P"}  # Preparation stage
+ALLOWED_LABELS = {"W", "N1", "N2", "N3", "R"}
+
+
+# =========================
+# EPOCHING SETTINGS
+# =========================
+FS_HZ = 100
+EPOCH_SEC = 30
+SAMPLES_PER_EPOCH = FS_HZ * EPOCH_SEC  # 3000
+CHUNK_ROWS = 300_000  # chunked reading to avoid RAM blowups
+
+
+# =========================
+# PER-NIGHT SIGNAL NORMALIZATION (robust z)
+# =========================
+DO_ROBUST_NIGHT_NORM = True
+NORM_IQR_EPS = 1e-6
+NORM_STATS_SAMPLE_ROWS = 200_000  # estimate median/IQR from first N rows (fast)
+
+# =========================
+# ECG->HEART RATE SETTINGS
+# =========================
+REFRACTORY_SEC = 0.25
+REFRACTORY_SAMPLES = int(REFRACTORY_SEC * FS_HZ)
+
+THRESH_Z = 1.0
+MIN_PEAK_PROM_Z = 0.2
+
+ECG_SMOOTH_MS = 40
+ECG_SMOOTH_SAMPLES = max(1, int(ECG_SMOOTH_MS * FS_HZ / 1000))
+
+# =========================
+# BANDPOWER SETTINGS (EEG)
+# =========================
+DO_BANDPOWER = True
+BP_BANDS = {
+    "delta": (0.5, 4.0),
+    "theta": (4.0, 8.0),
+    "alpha": (8.0, 12.0),
+    "beta": (12.0, 30.0),
+}
+BP_TOTAL_BAND = (0.5, 30.0)
+BP_LOG_EPS = 1e-12
+
+
+# =========================
+# TRAIN/TEST SPLIT
+# =========================
+RANDOM_SEED = 2
+TEST_SIZE = 0.20
+VAL_SIZE = 0.20
+SPLIT_BY_NIGHT = True  # recommended; prevents leakage across same night
+
+
+# =========================
+# XGBOOST SETTINGS (native train)
+# =========================
+N_ESTIMATORS = 5000
+LEARNING_RATE = 0.03
+MAX_DEPTH = 6
+SUBSAMPLE = 0.8
+COLSAMPLE_BYTREE = 0.8
+REG_LAMBDA = 1.0
+
+USE_CLASS_WEIGHTS = True
+#N1_BOOST = 4.0
+MAX_WEIGHT = 10.0
+
+EVAL_METRIC = "mlogloss"
+EARLY_STOPPING_ROUNDS = 75
+
+SAVE_EPOCH_FEATURE_TABLE = True
+
+
+print(f"[INFO] MODE: {MODE}")
+print(f"[INFO] Input folder: {IN_DIR}")
+print(f"[INFO] Found {len(IN_FILES)} CSV files.")
+print(f"[INFO] XGBoost num_boost_round(max trees): {N_ESTIMATORS}")
+print(f"[INFO] RANDOM_SEED: {RANDOM_SEED}")
+print(f"[INFO] Split: TEST_SIZE={TEST_SIZE} | VAL_SIZE={VAL_SIZE} | SPLIT_BY_NIGHT={SPLIT_BY_NIGHT}")
+print(f"[INFO] Label policy: exclude={sorted(EXCLUDE_LABELS)} | allowed={sorted(ALLOWED_LABELS)}")
+print(f"[INFO] Night robust normalization: {DO_ROBUST_NIGHT_NORM} | Bandpower: {DO_BANDPOWER}")
+print(f"[INFO] Early stopping: rounds={EARLY_STOPPING_ROUNDS} | metric={EVAL_METRIC}")
+
+
+# -------------------------
+# helpers
+# -------------------------
+def _make_run_dir() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = RUNS_DIR / f"run_{stamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def mode_str(series: pd.Series) -> str:
+    vals = series.dropna().astype(str).tolist()
+    if not vals:
+        return "missing"
+    return Counter(vals).most_common(1)[0][0]
+
+
+def _normalize_stage_label(x: object) -> str | None:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    s = str(x).strip().upper()
+    if s in EXCLUDE_LABELS:
+        return None
+    if s in ALLOWED_LABELS:
+        return s
+    return None
+
+
+def _coerce_numeric_fill(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+        med = out[c].median() if out[c].notna().any() else 0.0
+        out[c] = out[c].fillna(med).astype(np.float32)
+    return out
+
+
+def _compute_sample_weights(y_int: np.ndarray, classes: list[str]) -> np.ndarray:
+    y_int = np.asarray(y_int).reshape(-1)
+    n = len(y_int)
+    K = len(classes)
+    counts = np.bincount(y_int, minlength=K).astype(float)
+    counts[counts == 0] = 1.0
+    base_w = (n / (K * counts))
+    w = base_w[y_int]
+    if "N1" in classes:
+        w[y_int == classes.index("N1")] #*= float(N1_BOOST)
+    return np.clip(w, 0.0, float(MAX_WEIGHT)).astype(np.float32)
+
+# -------------------------
+# robust normalization
+# -------------------------
+def _robust_stats_from_series(x: pd.Series) -> tuple[float, float]:
+    v = pd.to_numeric(x, errors="coerce").to_numpy(dtype=np.float64)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0, 1.0
+    med = float(np.median(v))
+    q1 = float(np.quantile(v, 0.25))
+    q3 = float(np.quantile(v, 0.75))
+    iqr = max(q3 - q1, NORM_IQR_EPS)
+    rstd = iqr / 1.349
+    if not np.isfinite(rstd) or rstd < NORM_IQR_EPS:
+        rstd = 1.0
+    return med, rstd
+
+
+def _apply_robust_norm_df(df: pd.DataFrame, cols: list[str], stats: dict[str, tuple[float, float]]) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        med, rstd = stats.get(c, (0.0, 1.0))
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+        out[c] = ((out[c] - med) / rstd).astype(np.float32)
+    return out
+
+
+# -------------------------
+# bandpower (FFT-based)
+# -------------------------
+def bandpower_features(x: np.ndarray, fs: int) -> dict[str, float]:
+    v = np.asarray(x, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    if v.size < max(32, int(0.5 * fs)):
+        out = {"bp_total": np.nan}
+        for name in BP_BANDS:
+            out[f"bp_{name}"] = np.nan
+            out[f"bp_rel_{name}"] = np.nan
+            out[f"bp_log_{name}"] = np.nan
+        return out
+
+    v = v - np.mean(v)
+    n = v.size
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    fft = np.fft.rfft(v)
+    pxx = (np.abs(fft) ** 2) / (fs * n)
+
+    def _bandpow(lo: float, hi: float) -> float:
+        mask = (freqs >= lo) & (freqs <= hi)
+        if not np.any(mask):
+            return 0.0
+        return float(np.trapezoid(pxx[mask], freqs[mask]))
+
+    total = _bandpow(BP_TOTAL_BAND[0], BP_TOTAL_BAND[1])
+    if not np.isfinite(total) or total <= 0:
+        total = np.nan
+
+    out = {"bp_total": float(total) if np.isfinite(total) else np.nan}
+    for name, (lo, hi) in BP_BANDS.items():
+        p = _bandpow(lo, hi)
+        out[f"bp_{name}"] = float(p)
+        out[f"bp_log_{name}"] = float(np.log(p + BP_LOG_EPS))
+        out[f"bp_rel_{name}"] = float(p / total) if np.isfinite(total) and total > 0 else np.nan
+    return out
+
+
+# -------------------------
+# ECG -> HR features
+# -------------------------
+def _moving_average(x: np.ndarray, w: int) -> np.ndarray:
+    if w <= 1:
+        return x
+    k = np.ones(w, dtype=np.float64) / float(w)
+    return np.convolve(x, k, mode="same")
+
+
+def _detect_r_peaks(ecg: np.ndarray) -> np.ndarray:
+    x = np.asarray(ecg, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if x.size < 10:
+        return np.array([], dtype=np.int64)
+
+    baseline = _moving_average(x, w=max(3, ECG_SMOOTH_SAMPLES * 10))
+    y = x - baseline
+    y = _moving_average(y, w=ECG_SMOOTH_SAMPLES)
+
+    mu = np.nanmean(y)
+    sd = np.nanstd(y)
+    if not np.isfinite(sd) or sd < 1e-8:
+        return np.array([], dtype=np.int64)
+    z = (y - mu) / sd
+
+    peaks = []
+    last = -10**9
+    for i in range(1, len(z) - 1):
+        if i - last < REFRACTORY_SAMPLES:
+            continue
+        if z[i] > THRESH_Z and z[i] > z[i - 1] and z[i] >= z[i + 1]:
+            left = z[i] - z[i - 1]
+            right = z[i] - z[i + 1]
+            if (left + right) >= MIN_PEAK_PROM_Z:
+                peaks.append(i)
+                last = i
+    return np.array(peaks, dtype=np.int64)
+
+
+def ecg_to_hr_features(ecg_epoch: pd.Series) -> dict[str, float]:
+    x = pd.to_numeric(ecg_epoch, errors="coerce").to_numpy(dtype=np.float64)
+    x = x[np.isfinite(x)]
+
+    if x.size < SAMPLES_PER_EPOCH * 0.5:
+        return {"HR_bpm": np.nan, "HR_rr_mean": np.nan, "HR_rr_std": np.nan, "HR_beats": np.nan}
+
+    peaks = _detect_r_peaks(x)
+
+    beats = float(peaks.size)
+    if peaks.size < 2:
+        bpm = (beats / EPOCH_SEC) * 60.0 if beats > 0 else np.nan
+        return {"HR_bpm": bpm, "HR_rr_mean": np.nan, "HR_rr_std": np.nan, "HR_beats": beats}
+
+    rr = np.diff(peaks) / float(FS_HZ)
+    rr = rr[(rr > 0.3) & (rr < 2.0)]
+    if rr.size == 0:
+        bpm = (beats / EPOCH_SEC) * 60.0
+        return {"HR_bpm": bpm, "HR_rr_mean": np.nan, "HR_rr_std": np.nan, "HR_beats": beats}
+
+    rr_mean = float(np.mean(rr))
+    rr_std = float(np.std(rr))
+    bpm = float(60.0 / rr_mean) if rr_mean > 0 else np.nan
+    return {"HR_bpm": bpm, "HR_rr_mean": rr_mean, "HR_rr_std": rr_std, "HR_beats": beats}
+
+
+# -------------------------
+# Epoch feature building (single night)
+# -------------------------
+def build_epoch_feature_table(csv_path: Path, night_id: str) -> pd.DataFrame:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Input CSV not found: {csv_path}")
+
+    print("\n[INFO] Building 30s epochs from:", csv_path)
+
+    head = pd.read_csv(csv_path, nrows=5)
+    needed = [TIME_COL, ECG_COL, *EEG_COLS]
+    missing = [c for c in needed if c not in head.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in {csv_path.name}: {missing}")
+
+    has_label = (LABEL_COL in head.columns)
+    if MODE.lower() == "train" and not has_label:
+        raise ValueError(f"MODE=train requires label column '{LABEL_COL}' in {csv_path.name}")
+
+    norm_cols = [ECG_COL, *EEG_COLS]
+    norm_stats: dict[str, tuple[float, float]] = {}
+
+    if DO_ROBUST_NIGHT_NORM:
+        try:
+            sample_df = pd.read_csv(csv_path, usecols=norm_cols, nrows=NORM_STATS_SAMPLE_ROWS)
+        except Exception:
+            sample_df = pd.read_csv(csv_path, nrows=NORM_STATS_SAMPLE_ROWS)[norm_cols]
+        for c in norm_cols:
+            norm_stats[c] = _robust_stats_from_series(sample_df[c])
+        print(f"[INFO] {night_id}: robust norm stats computed from first {NORM_STATS_SAMPLE_ROWS} rows")
+
+    buffer_df = None
+    global_row_index = 0
+    out_rows: list[pd.DataFrame] = []
+
+    for chunk_i, df in enumerate(pd.read_csv(csv_path, chunksize=CHUNK_ROWS), start=1):
+        if buffer_df is not None and len(buffer_df) > 0:
+            df = pd.concat([buffer_df, df], axis=0, ignore_index=True)
+            buffer_df = None
+
+        if DO_ROBUST_NIGHT_NORM:
+            df = _apply_robust_norm_df(df, norm_cols, norm_stats)
+
+        n = len(df)
+        df["_epoch_id"] = (global_row_index + np.arange(n)) // SAMPLES_PER_EPOCH
+
+        last_epoch = df["_epoch_id"].iloc[-1]
+        is_last = df["_epoch_id"] == last_epoch
+        last_count = int(is_last.sum())
+        if last_count < SAMPLES_PER_EPOCH:
+            buffer_df = df.loc[is_last].drop(columns=["_epoch_id"]).reset_index(drop=True)
+            df = df.loc[~is_last].reset_index(drop=True)
+            global_row_index += (n - last_count)
+        else:
+            global_row_index += n
+
+        if df.empty:
+            print(f"[INFO] {night_id} chunk {chunk_i}: buffering (no full epochs yet)")
+            continue
+
+        gb = df.groupby("_epoch_id", sort=True)
+
+        # EEG aggregation
+        eeg_df = df[EEG_COLS].apply(pd.to_numeric, errors="coerce").astype(np.float32)
+        eeg_df["_epoch_id"] = df["_epoch_id"].to_numpy()
+        eeg_gb = eeg_df.groupby("_epoch_id", sort=True)
+
+        eeg_agg = eeg_gb.agg(["mean", "std", "min", "max"])
+        eeg_agg.columns = [f"{ch}__{stat}" for (ch, stat) in eeg_agg.columns]
+        eeg_agg = eeg_agg.reset_index()
+
+        ptp_rows, rms_rows, bp_rows = [], [], []
+        for eid, g in eeg_gb:
+            row_ptp = {"_epoch_id": eid}
+            row_rms = {"_epoch_id": eid}
+            row_bp = {"_epoch_id": eid}
+
+            for ch in EEG_COLS:
+                x = g[ch].to_numpy(dtype=np.float64)
+                x = x[np.isfinite(x)]
+
+                row_ptp[f"{ch}__ptp"] = float(np.max(x) - np.min(x)) if x.size else np.nan
+                row_rms[f"{ch}__rms"] = float(np.sqrt(np.mean(x * x))) if x.size else np.nan
+
+                if DO_BANDPOWER:
+                    bp = bandpower_features(x, fs=FS_HZ)
+                    for k, v in bp.items():
+                        row_bp[f"{ch}__{k}"] = v
+
+            ptp_rows.append(row_ptp)
+            rms_rows.append(row_rms)
+            if DO_BANDPOWER:
+                bp_rows.append(row_bp)
+
+        feats = (
+            eeg_agg
+            .merge(pd.DataFrame(ptp_rows), on="_epoch_id", how="left")
+            .merge(pd.DataFrame(rms_rows), on="_epoch_id", how="left")
+        )
+        if DO_BANDPOWER:
+            feats = feats.merge(pd.DataFrame(bp_rows), on="_epoch_id", how="left")
+
+        # HR features from ECG
+        hr_rows = []
+        for eid, g in gb:
+            hr = ecg_to_hr_features(g[ECG_COL])
+            hr["_epoch_id"] = eid
+            hr_rows.append(hr)
+        feats = feats.merge(pd.DataFrame(hr_rows), on="_epoch_id", how="left")
+
+        # time start/end
+        feats = feats.merge(gb[TIME_COL].min().rename("time_start").reset_index(), on="_epoch_id", how="left")
+        feats = feats.merge(gb[TIME_COL].max().rename("time_end").reset_index(), on="_epoch_id", how="left")
+
+        # label mode + filtering
+        if has_label and LABEL_COL in df.columns:
+            y = gb[LABEL_COL].apply(mode_str).rename(LABEL_COL).reset_index()
+            y[LABEL_COL] = y[LABEL_COL].map(_normalize_stage_label)
+            feats = feats.merge(y, on="_epoch_id", how="left")
+
+            before = len(feats)
+            feats = feats.dropna(subset=[LABEL_COL]).reset_index(drop=True)
+            dropped = before - len(feats)
+            if dropped > 0:
+                print(f"[INFO] {night_id} chunk {chunk_i}: dropped {dropped} epochs (excluded/unknown labels like P)")
+
+        out_rows.append(feats)
+        print(f"[INFO] {night_id} chunk {chunk_i}: produced {len(feats)} epochs")
+
+    if not out_rows:
+        raise RuntimeError(f"No complete epochs produced for {csv_path.name}")
+
+    epoch_df = pd.concat(out_rows, axis=0, ignore_index=True)
+    epoch_df["night_id"] = night_id
+    epoch_df["source_file"] = str(csv_path)
+
+    print(f"[INFO] {night_id}: epoch feature table shape:", epoch_df.shape)
+    if LABEL_COL in epoch_df.columns:
+        print(f"[INFO] {night_id}: label counts AFTER filtering:")
+        print(epoch_df[LABEL_COL].value_counts().head(10))
+
+    return epoch_df
+
+
+def build_all_nights_epoch_table(files: list[Path]) -> pd.DataFrame:
+    all_epochs = []
+    for fp in files:
+        night_id = fp.stem
+        print(f"\n[INFO] ===== Processing night: {night_id} =====")
+        all_epochs.append(build_epoch_feature_table(fp, night_id=night_id))
+
+    out = pd.concat(all_epochs, axis=0, ignore_index=True)
+    print(f"\n[INFO] Combined epoch table shape: {out.shape}")
+    print("[INFO] Nights:", out["night_id"].nunique())
+    if LABEL_COL in out.columns:
+        print("[INFO] Combined label counts AFTER filtering:")
+        print(out[LABEL_COL].value_counts().head(20))
+    return out
+
+
+def split_by_night(epoch_df: pd.DataFrame, test_size: float, seed: int):
+    nights = epoch_df["night_id"].dropna().unique().tolist()
+    if len(nights) < 2:
+        print("[WARN] Only 1 night found — falling back to epoch-level split (may inflate results).")
+        return None, None, None
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(nights)
+
+    n_test = max(1, int(round(len(nights) * test_size)))
+    test_nights = set(nights[:n_test])
+
+    is_test = epoch_df["night_id"].isin(test_nights)
+    train_df = epoch_df.loc[~is_test].reset_index(drop=True)
+    test_df = epoch_df.loc[is_test].reset_index(drop=True)
+
+    print(f"[INFO] Night-split: train nights={train_df['night_id'].nunique()} | test nights={test_df['night_id'].nunique()}")
+    print(f"[INFO] Night-split: train epochs={len(train_df)} | test epochs={len(test_df)}")
+    return train_df, test_df, sorted(test_nights)
+
+
+def train(epoch_df: pd.DataFrame):
+    if LABEL_COL not in epoch_df.columns:
+        raise ValueError(f"Training requires label column '{LABEL_COL}' in the epoch table.")
+
+    epoch_df = epoch_df.copy()
+    epoch_df[LABEL_COL] = epoch_df[LABEL_COL].map(_normalize_stage_label)
+    epoch_df = epoch_df.dropna(subset=[LABEL_COL]).reset_index(drop=True)
+
+    if epoch_df.empty:
+        raise ValueError("After filtering labels (dropping P, keeping W/N1/N2/N3/R), there are 0 epochs left.")
+
+    # split
+    if SPLIT_BY_NIGHT:
+        train_df, test_df, test_nights = split_by_night(epoch_df, TEST_SIZE, RANDOM_SEED)
+    else:
+        train_df, test_df, test_nights = None, None, None
+
+    if train_df is None or test_df is None:
+        train_df, test_df = train_test_split(
+            epoch_df, test_size=TEST_SIZE, random_state=RANDOM_SEED, stratify=epoch_df[LABEL_COL].astype(str)
+        )
+        train_df = train_df.reset_index(drop=True)
+        test_df = test_df.reset_index(drop=True)
+
+    # val split from train
+    if SPLIT_BY_NIGHT and train_df["night_id"].nunique() >= 3:
+        nights = train_df["night_id"].unique().tolist()
+        rng = np.random.default_rng(RANDOM_SEED + 999)
+        rng.shuffle(nights)
+        n_val = max(1, int(round(len(nights) * VAL_SIZE)))
+        val_nights = set(nights[:n_val])
+        is_val = train_df["night_id"].isin(val_nights)
+        val_df = train_df.loc[is_val].reset_index(drop=True)
+        tr_df = train_df.loc[~is_val].reset_index(drop=True)
+        print(f"[INFO] Val night-split: train nights={tr_df['night_id'].nunique()} | val nights={val_df['night_id'].nunique()}")
+    else:
+        tr_df, val_df = train_test_split(
+            train_df, test_size=VAL_SIZE, random_state=RANDOM_SEED, stratify=train_df[LABEL_COL].astype(str)
+        )
+        tr_df = tr_df.reset_index(drop=True)
+        val_df = val_df.reset_index(drop=True)
+
+    # build X/y
+    y_train_raw = tr_df[LABEL_COL].astype(str).copy()
+    y_val_raw = val_df[LABEL_COL].astype(str).copy()
+    y_test_raw = test_df[LABEL_COL].astype(str).copy()
+
+    drop_cols = [LABEL_COL, "_epoch_id", "time_start", "time_end", "night_id", "source_file"]
+    X_train = tr_df.drop(columns=drop_cols, errors="ignore").copy()
+    X_val = val_df.drop(columns=drop_cols, errors="ignore").copy()
+    X_test = test_df.drop(columns=drop_cols, errors="ignore").copy()
+
+    numeric_cols = [c for c in X_train.columns if pd.api.types.is_numeric_dtype(X_train[c])]
+    X_train = _coerce_numeric_fill(X_train, numeric_cols)
+    X_val = _coerce_numeric_fill(X_val, numeric_cols)
+    X_test = _coerce_numeric_fill(X_test, numeric_cols)
+
+    le = LabelEncoder()
+    y_train = le.fit_transform(y_train_raw)
+    y_val = le.transform(y_val_raw)
+    y_test = le.transform(y_test_raw)
+
+    classes = list(le.classes_)
+    K = len(classes)
+    print(f"[INFO] Classes ({K}): {classes}")
+    if "N3" not in classes:
+        print("[WARN] N3 not present in TRAIN split.")
+
+    w_train = _compute_sample_weights(y_train, classes) if USE_CLASS_WEIGHTS else None
+
+    # numeric passthrough preprocessor (kept so predict path stays consistent)
+    preprocessor = ColumnTransformer(
+        transformers=[("num", "passthrough", numeric_cols)],
+        remainder="drop",
+    )
+    preprocessor.fit(X_train)
+
+    Xtr = preprocessor.transform(X_train).astype(np.float32)
+    Xva = preprocessor.transform(X_val).astype(np.float32)
+    Xte = preprocessor.transform(X_test).astype(np.float32)
+
+    dtrain = xgb.DMatrix(Xtr, label=y_train, weight=w_train)
+    dval = xgb.DMatrix(Xva, label=y_val)
+    dtest = xgb.DMatrix(Xte, label=y_test)
+
+    params = {
+        "objective": "multi:softprob",
+        "num_class": K,
+        "eta": LEARNING_RATE,
+        "max_depth": MAX_DEPTH,
+        "subsample": SUBSAMPLE,
+        "colsample_bytree": COLSAMPLE_BYTREE,
+        "lambda": REG_LAMBDA,
+        "eval_metric": EVAL_METRIC,
+        "seed": RANDOM_SEED,
+        "verbosity": 1,
+    }
+
+    evals = [(dtrain, "train"), (dval, "val")]
+
+    print("[INFO] Training with xgb.train (native) + early stopping...")
+    bst = xgb.train(
+        params=params,
+        dtrain=dtrain,
+        num_boost_round=N_ESTIMATORS,
+        evals=evals,
+        early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+        verbose_eval=200,
+    )
+
+    print(f"[INFO] best_iteration: {bst.best_iteration}")
+    print(f"[INFO] best_score: {bst.best_score}")
+
+    proba = bst.predict(dtest)  # shape (n, K)
+    y_pred = np.argmax(proba, axis=1).astype(int)
+
+    acc = accuracy_score(y_test, y_pred)
+    f1m = f1_score(y_test, y_pred, average="macro")
+    cm = confusion_matrix(y_test, y_pred, labels=list(range(K)))
+    report = classification_report(y_test, y_pred, target_names=classes, digits=4)
+
+    print(f"[INFO] Test accuracy : {acc:.4f}")
+    print(f"[INFO] Test f1_macro : {f1m:.4f}")
+
+    run_dir = _make_run_dir()
+
+    # save booster model
+    model_path = run_dir / "xgb_model.json"
+    bst.save_model(str(model_path))
+
+    bundle = {
+        "preprocessor": preprocessor,
+        "label_encoder": le,
+        "classes": classes,
+        "feature_columns": list(X_train.columns),
+        "xgb_model_path": str(model_path),
+        "xgb_params": params,
+        "best_iteration": int(bst.best_iteration),
+        "label_policy": {"exclude": sorted(EXCLUDE_LABELS), "allowed": sorted(ALLOWED_LABELS)},
+        "split_policy": {"split_by_night": SPLIT_BY_NIGHT, "test_size": TEST_SIZE, "val_size": VAL_SIZE, "seed": RANDOM_SEED},
+        "epoching": {"fs_hz": FS_HZ, "epoch_sec": EPOCH_SEC, "samples_per_epoch": SAMPLES_PER_EPOCH},
+        "bandpower": {"enabled": DO_BANDPOWER, "bands": BP_BANDS, "total_band": BP_TOTAL_BAND},
+        "night_norm": {"enabled": DO_ROBUST_NIGHT_NORM, "type": "median_iqr", "stats_sample_rows": NORM_STATS_SAMPLE_ROWS},
+        "early_stopping": {"rounds": EARLY_STOPPING_ROUNDS, "metric": EVAL_METRIC},
+    }
+
+    joblib.dump(bundle, run_dir / "model_bundle.joblib")
+
+    (run_dir / "classification_report.txt").write_text(report, encoding="utf-8")
+    pd.DataFrame(cm, index=classes, columns=classes).to_csv(run_dir / "confusion_matrix.csv", index=True)
+
+    with open(run_dir / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {"test_accuracy": float(acc), "test_f1_macro": float(f1m), "best_iteration": int(bst.best_iteration), "best_score": float(bst.best_score)},
+            f,
+            indent=2,
+        )
+
+    if SAVE_EPOCH_FEATURE_TABLE:
+        epoch_df.to_csv(run_dir / "epoch_features_30s_eeg_hr_ALL_NIGHTS.csv", index=False)
+
+    print("[INFO] Saved run artifacts to:", run_dir)
+    if SPLIT_BY_NIGHT and test_nights is not None:
+        print("[INFO] Held-out test nights:", test_nights)
+
+
+def predict(epoch_df: pd.DataFrame):
+    if not MODEL_BUNDLE_PATH.exists():
+        raise FileNotFoundError(f"Model bundle not found: {MODEL_BUNDLE_PATH}")
+
+    bundle = joblib.load(MODEL_BUNDLE_PATH)
+    preprocessor = bundle["preprocessor"]
+    le = bundle["label_encoder"]
+    classes = bundle["classes"]
+    feature_columns = bundle.get("feature_columns", None)
+    model_path = Path(bundle["xgb_model_path"])
+
+    if not model_path.exists():
+        # allow model path to be relative to the bundle folder
+        alt = MODEL_BUNDLE_PATH.parent / model_path.name
+        if alt.exists():
+            model_path = alt
+        else:
+            raise FileNotFoundError(f"Saved booster model not found: {model_path}")
+
+    bst = xgb.Booster()
+    bst.load_model(str(model_path))
+
+    drop_cols = [LABEL_COL, "_epoch_id", "time_start", "time_end", "night_id", "source_file"]
+    X = epoch_df.drop(columns=drop_cols, errors="ignore").copy()
+
+    if feature_columns is not None:
+        missing = [c for c in feature_columns if c not in X.columns]
+        if missing:
+            raise ValueError(f"Missing required feature columns for prediction: {missing[:20]}{'...' if len(missing)>20 else ''}")
+        X = X[feature_columns].copy()
+
+    numeric_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    X = _coerce_numeric_fill(X, numeric_cols)
+
+    Xp = preprocessor.transform(X).astype(np.float32)
+    dpred = xgb.DMatrix(Xp)
+
+    proba = bst.predict(dpred)  # (n, K)
+    y_pred_int = np.argmax(proba, axis=1).astype(int)
+    y_pred = le.inverse_transform(y_pred_int)
+
+    out = pd.DataFrame({
+        "night_id": epoch_df["night_id"] if "night_id" in epoch_df.columns else "unknown",
+        "epoch_id": epoch_df["_epoch_id"] if "_epoch_id" in epoch_df.columns else np.arange(len(epoch_df)),
+        "time_start": epoch_df["time_start"] if "time_start" in epoch_df.columns else np.nan,
+        "time_end": epoch_df["time_end"] if "time_end" in epoch_df.columns else np.nan,
+        "y_pred": y_pred,
+    })
+    proba_df = pd.DataFrame(proba, columns=[f"proba_{c}" for c in classes])
+    out = pd.concat([out.reset_index(drop=True), proba_df.reset_index(drop=True)], axis=1)
+
+    pred_out = MODEL_BUNDLE_PATH.parent / "predictions_epoch30s_eeg_hr_ALL_NIGHTS.csv"
+    out.to_csv(pred_out, index=False)
+    print("[INFO] Saved predictions to:", pred_out)
+
+
+def main():
+    if not IN_DIR.exists():
+        raise FileNotFoundError(f"Input folder not found: {IN_DIR}")
+    if len(IN_FILES) == 0:
+        raise FileNotFoundError(f"No CSV files found in: {IN_DIR}")
+
+    epoch_df = build_all_nights_epoch_table(IN_FILES)
+
+    # fill HR NaNs with medians
+    for c in ["HR_bpm", "HR_rr_mean", "HR_rr_std", "HR_beats"]:
+        if c in epoch_df.columns:
+            epoch_df[c] = pd.to_numeric(epoch_df[c], errors="coerce")
+            med = epoch_df[c].median() if epoch_df[c].notna().any() else 0.0
+            epoch_df[c] = epoch_df[c].fillna(med).astype(np.float32)
+
+    if MODE.lower() == "train":
+        train(epoch_df)
+    elif MODE.lower() == "predict":
+        predict(epoch_df)
+    else:
+        raise ValueError("MODE must be 'train' or 'predict'.")
+
+
+if __name__ == "__main__":
+    main()
