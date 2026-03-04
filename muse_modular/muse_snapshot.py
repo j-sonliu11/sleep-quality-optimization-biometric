@@ -83,4 +83,5 @@ def save_snapshot_csv(eeg: LSLReceiver, ppg: LSLReceiver, seconds: float) -> Pat
             row["PPG_QUALITY_SCORE"] = float(q_score)
             w.writerow(row)
 
+
     return p
