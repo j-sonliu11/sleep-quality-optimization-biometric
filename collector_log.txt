@@ -1,0 +1,54 @@
+[2026-03-03T20:18:36] START | csv=muse_epochs_20260303_201836.csv
+[2026-03-03T20:19:07] EPOCH | wrote row 1
+[2026-03-03T20:19:37] EPOCH | wrote row 2
+[2026-03-03T20:20:07] EPOCH | wrote row 3
+[2026-03-03T20:20:37] EPOCH | wrote row 4
+[2026-03-03T20:21:07] EPOCH | wrote row 5
+[2026-03-03T20:21:37] EPOCH | wrote row 6
+[2026-03-03T20:22:08] EPOCH | wrote row 7
+[2026-03-03T20:22:37] EPOCH | wrote row 8
+[2026-03-03T20:23:07] EPOCH | wrote row 9
+[2026-03-03T20:23:37] EPOCH | wrote row 10
+[2026-03-03T20:24:07] EPOCH | wrote row 11
+[2026-03-03T20:24:37] EPOCH | wrote row 12
+[2026-03-03T20:25:07] EPOCH | wrote row 13
+[2026-03-03T20:25:37] EPOCH | wrote row 14
+[2026-03-03T20:26:08] EPOCH | wrote row 15
+[2026-03-03T20:26:37] EPOCH | wrote row 16
+[2026-03-03T20:27:07] EPOCH | wrote row 17
+[2026-03-03T20:27:38] EPOCH | wrote row 18
+[2026-03-03T20:28:07] EPOCH | wrote row 19
+[2026-03-03T20:28:37] EPOCH | wrote row 20
+[2026-03-03T20:29:07] EPOCH | wrote row 21
+[2026-03-03T20:29:37] EPOCH | wrote row 22
+[2026-03-03T20:30:07] EPOCH | wrote row 23
+[2026-03-03T20:30:37] EPOCH | wrote row 24
+[2026-03-03T20:31:07] EPOCH | wrote row 25
+[2026-03-03T20:31:37] EPOCH | wrote row 26
+[2026-03-03T20:32:08] EPOCH | wrote row 27
+[2026-03-03T20:32:37] EPOCH | wrote row 28
+[2026-03-03T20:33:07] EPOCH | wrote row 29
+[2026-03-03T20:33:37] EPOCH | wrote row 30
+[2026-03-03T20:34:07] EPOCH | wrote row 31
+[2026-03-03T20:34:37] EPOCH | wrote row 32
+[2026-03-03T20:35:08] EPOCH | wrote row 33
+[2026-03-03T20:35:37] EPOCH | wrote row 34
+[2026-03-03T20:36:07] EPOCH | wrote row 35
+[2026-03-03T20:36:38] EPOCH | wrote row 36
+[2026-03-03T20:37:07] EPOCH | wrote row 37
+[2026-03-03T20:37:37] EPOCH | wrote row 38
+[2026-03-03T20:38:07] EPOCH | wrote row 39
+[2026-03-03T20:38:37] EPOCH | wrote row 40
+[2026-03-03T20:39:08] EPOCH | wrote row 41
+[2026-03-03T20:39:38] EPOCH | wrote row 42
+[2026-03-03T20:40:07] EPOCH | wrote row 43
+[2026-03-03T20:40:38] EPOCH | wrote row 44
+[2026-03-03T20:41:08] EPOCH | wrote row 45
+[2026-03-03T20:41:37] EPOCH | wrote row 46
+[2026-03-03T20:42:07] EPOCH | wrote row 47
+[2026-03-03T20:42:38] EPOCH | wrote row 48
+[2026-03-03T20:43:07] EPOCH | wrote row 49
+[2026-03-03T20:43:10] STOP | reason=Stop button pressed
+[2026-03-03T20:43:10] THREAD | exit (running=False)
+[2026-03-03T20:43:12] STOP | reason=Finalize requested (save hypnogram)
+[2026-03-03T20:43:13] HYP | saved=hypnogram_pred.png
